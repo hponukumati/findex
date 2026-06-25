@@ -27,3 +27,7 @@ vendor/
 
 # Env
 .env
+
+# Go binaries
+findex
+bin/

@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -15,21 +17,24 @@ type QueryOptions struct {
 	Limit      int
 	ExtFilter  map[string]struct{} // e.g. {"pdf":{}}
 	Shortlist  int                 // how many candidates to pull from DB
+	RelevanceK int                 // how many top-scoring candidates to keep before ranking by recency
 }
 
 type Result struct {
-	Path     string
-	Filename string
-	Ext      string
-	Mtime    int64
-	Size     int64
-	Score    float64
+	Path       string
+	Filename   string
+	Ext        string
+	Mtime      int64
+	LastOpened int64
+	Size       int64
+	Score      float64
 }
 
 func DefaultQueryOptions() QueryOptions {
 	return QueryOptions{
-		Limit:     30,
-		Shortlist: 800, // tune: 200–2000 depending on disk size
+		Limit:      30,
+		Shortlist:  800, // tune: 200–2000 depending on disk size
+		RelevanceK: 50,  // only the top-K relevant candidates get a real "last opened" lookup
 	}
 }
 
@@ -42,6 +47,9 @@ func Search(db *sql.DB, q string, opts QueryOptions) ([]Result, error) {
 	}
 	if opts.Shortlist <= 0 {
 		opts.Shortlist = 800
+	}
+	if opts.RelevanceK <= 0 {
+		opts.RelevanceK = 50
 	}
 
 	if qNorm == "" {
@@ -144,20 +152,63 @@ func Search(db *sql.DB, q string, opts QueryOptions) ([]Result, error) {
 		cands[i].Score = score
 	}
 
+	// Stage 1: keep only the most relevant candidates. Sorting the full
+	// shortlist by recency would let a weak match with a recent mtime
+	// outrank a strong match that's older, so relevance gates first.
 	sort.SliceStable(cands, func(i, j int) bool {
-	// Primary: latest modified
-	if cands[i].Mtime != cands[j].Mtime {
-		return cands[i].Mtime > cands[j].Mtime
-	}
-	// Secondary: relevance score
-	return cands[i].Score > cands[j].Score
+		return cands[i].Score > cands[j].Score
 	})
+	if len(cands) > opts.RelevanceK {
+		cands = cands[:opts.RelevanceK]
+	}
 
+	// Stage 2: within the relevant set, rank by true "last opened" time
+	// (falling back to mtime when that's unavailable), so the freshest
+	// relevant file surfaces first.
+	for i := range cands {
+		cands[i].LastOpened = lastOpenedUnix(cands[i].Path, cands[i].Mtime)
+	}
+
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].LastOpened != cands[j].LastOpened {
+			return cands[i].LastOpened > cands[j].LastOpened
+		}
+		return cands[i].Score > cands[j].Score
+	})
 
 	if len(cands) > opts.Limit {
 		cands = cands[:opts.Limit]
 	}
 	return cands, nil
+}
+
+// lastOpenedUnix returns the file's true last-opened time via Spotlight
+// metadata (kMDItemLastUsedDate) on macOS, falling back to mtime when
+// Spotlight has no record for the file or we're not on macOS.
+func lastOpenedUnix(path string, mtimeFallback int64) int64 {
+	if runtime.GOOS != "darwin" {
+		return mtimeFallback
+	}
+	t, err := mdlsLastUsedDate(path)
+	if err != nil || t.IsZero() {
+		return mtimeFallback
+	}
+	return t.Unix()
+}
+
+// mdlsLastUsedDateLayout matches mdls -raw output, e.g. "2024-06-20 14:23:11 +0000".
+const mdlsLastUsedDateLayout = "2006-01-02 15:04:05 -0700"
+
+func mdlsLastUsedDate(path string) (time.Time, error) {
+	out, err := exec.Command("mdls", "-raw", "-name", "kMDItemLastUsedDate", path).Output()
+	if err != nil {
+		return time.Time{}, err
+	}
+	raw := strings.TrimSpace(string(out))
+	if raw == "" || raw == "(null)" {
+		return time.Time{}, nil
+	}
+	return time.Parse(mdlsLastUsedDateLayout, raw)
 }
 
 func tokenOverlapCount(a, b []string) int {
